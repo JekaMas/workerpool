@@ -390,10 +390,6 @@ func (p *WorkerPool) GetWorkerCount() int {
 	return int(p.workerCount.Load())
 }
 
-func (p *WorkerPool) GetWaitingQueueLength() int32 {
-	return atomic.LoadInt32(&p.waiting)
-}
-
 // GetStatsAndReset returns the number of executions taken place from
 // last call. Ideally, it can be used to calculate rate of processing.
 func (p *WorkerPool) GetStatsAndReset() uint64 {
