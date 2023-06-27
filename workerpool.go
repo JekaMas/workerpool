@@ -37,6 +37,7 @@ func New(maxWorkers int) *WorkerPool {
 
 	// Start the task dispatcher.
 	go pool.dispatch()
+	go pool.cleanup()
 
 	return pool
 }
@@ -54,6 +55,7 @@ type WorkerPool struct {
 	stopLock     sync.Mutex
 	stopOnce     sync.Once
 	stopped      bool
+	processed    atomic.Uint64
 	waiting      int32
 	wait         bool
 }
@@ -209,7 +211,7 @@ Loop:
 				// Create a new worker, if not at max.
 				if int(p.workerCount.Load()) < p.maxWorkers {
 					wg.Add(1)
-					go worker(task, p.workerQueue, &wg)
+					go worker(task, p.workerQueue, &wg, &p.processed)
 					p.workerCount.Add(1)
 				} else {
 					// Enqueue task to be executed by next available worker.
@@ -277,7 +279,7 @@ func NewTask(ctx context.Context, fn func() error, timeout ...time.Duration) poo
 var ErrTimeout = errors.New("timeout")
 
 // worker executes tasks and stops when it receives a nil task.
-func worker(task poolTask, workerQueue chan poolTask, wg *sync.WaitGroup) {
+func worker(task poolTask, workerQueue chan poolTask, wg *sync.WaitGroup, processed *atomic.Uint64) {
 	errCh := make(chan error, 1)
 	tasks := make(chan poolTask, 1)
 
@@ -286,6 +288,7 @@ func worker(task poolTask, workerQueue chan poolTask, wg *sync.WaitGroup) {
 	go func() {
 		for execTask := range tasks {
 			err := execTask.task()
+			processed.Add(1)
 
 			select {
 			case <-execTask.ctx.Done():
@@ -300,6 +303,7 @@ func worker(task poolTask, workerQueue chan poolTask, wg *sync.WaitGroup) {
 	for task.task != nil {
 		if task.cancel == nil {
 			task.Err <- task.task()
+			processed.Add(1)
 			task = <-workerQueue
 		} else {
 			tasks <- task
@@ -388,4 +392,27 @@ func (p *WorkerPool) GetWorkerCount() int {
 
 func (p *WorkerPool) GetWaitingQueueLength() int32 {
 	return atomic.LoadInt32(&p.waiting)
+}
+
+// GetStatsAndReset returns the number of executions taken place from
+// last call. Ideally, it can be used to calculate rate of processing.
+func (p *WorkerPool) GetStatsAndReset() uint64 {
+	processed := p.processed.Load()
+	p.processed.Store(0)
+	return processed
+}
+
+// cleanup the `processed` variable every hour assuming it's not
+// done via GetStatsAndReset method.
+func (p *WorkerPool) cleanup() {
+	ticker := time.NewTicker(time.Hour)
+	for {
+		select {
+		case <-ticker.C:
+			p.processed.Store(0)
+		case <-p.stoppedChan:
+			ticker.Stop()
+			return
+		}
+	}
 }
