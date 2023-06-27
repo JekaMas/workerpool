@@ -45,6 +45,7 @@ func New(maxWorkers int) *WorkerPool {
 // goroutines processing requests does not exceed the specified maximum.
 type WorkerPool struct {
 	maxWorkers   int
+	workerCount  atomic.Pointer[int]
 	taskQueue    chan poolTask
 	workerQueue  chan poolTask
 	stoppedChan  chan struct{}
@@ -177,9 +178,12 @@ func (p *WorkerPool) Pause(ctx context.Context) {
 func (p *WorkerPool) dispatch() {
 	defer close(p.stoppedChan)
 	timeout := time.NewTimer(idleTimeout)
-	var workerCount int
-	var idle bool
-	var wg sync.WaitGroup
+	var (
+		workerCount int
+		idle        bool
+		wg          sync.WaitGroup
+	)
+	p.workerCount.Store(&workerCount)
 
 Loop:
 	for {
@@ -204,10 +208,12 @@ Loop:
 			case p.workerQueue <- task:
 			default:
 				// Create a new worker, if not at max.
+				workerCount := *p.workerCount.Load()
 				if workerCount < p.maxWorkers {
 					wg.Add(1)
 					go worker(task, p.workerQueue, &wg)
 					workerCount++
+					p.workerCount.Store(&workerCount)
 				} else {
 					// Enqueue task to be executed by next available worker.
 					p.waitingQueue.PushBack(task)
@@ -218,9 +224,11 @@ Loop:
 		case <-timeout.C:
 			// Timed out waiting for work to arrive. Kill a ready worker if
 			// pool has been idle for a whole timeout.
+			workerCount := *p.workerCount.Load()
 			if idle && workerCount > 0 {
 				if p.killIdleWorker() {
 					workerCount--
+					p.workerCount.Store(&workerCount)
 				}
 			}
 			idle = true
@@ -234,10 +242,12 @@ Loop:
 	}
 
 	// Stop all remaining workers as they become ready.
+	workerCount = *p.workerCount.Load()
 	for workerCount > 0 {
 		p.workerQueue <- NewTask(nil, nil)
 		workerCount--
 	}
+	p.workerCount.Store(&workerCount)
 	wg.Wait()
 
 	timeout.Stop()
@@ -376,4 +386,9 @@ func (p *WorkerPool) runQueuedTasks() {
 		p.workerQueue <- p.waitingQueue.PopFront()
 		atomic.StoreInt32(&p.waiting, int32(p.waitingQueue.Len()))
 	}
+}
+
+// GetWorkerCount returns the number of workers serving requests currently.
+func (p *WorkerPool) GetWorkerCount() int {
+	return *p.workerCount.Load()
 }
